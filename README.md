@@ -399,7 +399,7 @@ Event/activity tables
 
 ---
 
-
+## Adding a New Database
 
 1. Create a new adapter file (`databases/new_db.py`)
 2. Implement the `DatabaseAdapter` interface
