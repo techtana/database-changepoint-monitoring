@@ -1,0 +1,29 @@
+# -----------------------------------------------------------------------
+# Snowflake Change Monitor — configuration
+#
+# monitoring.snapshot_table   : fully-qualified name of the snapshot table
+# monitoring.changelog_table  : fully-qualified name of the change-log table
+#
+# tables[].name               : fully-qualified source table to monitor
+# tables[].pk_columns         : columns that uniquely identify a row
+#                               (values may be literal strings OR regex patterns
+#                               like "regex(abc.*)" — treated as opaque strings)
+# tables[].value_columns      : columns whose changes you want to track
+# -----------------------------------------------------------------------
+
+monitoring:
+  snapshot_table: "MYDB.MONITORING.DAILY_SNAPSHOTS"
+  changelog_table: "MYDB.MONITORING.CHANGE_LOG"
+
+tables:
+  - name: "MYDB.CONFIG.TABLE_A"
+    pk_columns:    [pk1, pk2, pk3]
+    value_columns: [val1, val2, val3]
+
+  - name: "MYDB.CONFIG.TABLE_B"
+    pk_columns:    [pk1, pk3]
+    value_columns: [val4, val5, val6]
+
+  - name: "MYDB.CONFIG.TABLE_C"
+    pk_columns:    [pk2]
+    value_columns: [val7, val8, val9]

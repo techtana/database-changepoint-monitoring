@@ -1,0 +1,12 @@
+# Credentials — never commit
+.env
+
+# Runtime output
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
