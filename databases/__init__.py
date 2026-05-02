@@ -1,8 +1,5 @@
 """Database adapter factory."""
 from .base import DatabaseAdapter
-from .snowflake import SnowflakeAdapter
-from .bigquery import BigQueryAdapter
-from .sqlite import SQLiteAdapter
 
 
 def get_adapter(db_type: str, config: dict) -> DatabaseAdapter:
@@ -16,20 +13,20 @@ def get_adapter(db_type: str, config: dict) -> DatabaseAdapter:
     Returns:
         Initialized DatabaseAdapter instance
     """
-    adapters = {
-        "snowflake": SnowflakeAdapter,
-        "bigquery": BigQueryAdapter,
-        "sqlite": SQLiteAdapter,
-    }
-
-    adapter_class = adapters.get(db_type)
-    if not adapter_class:
+    if db_type == "snowflake":
+        from .snowflake import SnowflakeAdapter
+        return SnowflakeAdapter(config)
+    elif db_type == "bigquery":
+        from .bigquery import BigQueryAdapter
+        return BigQueryAdapter(config)
+    elif db_type == "sqlite":
+        from .sqlite import SQLiteAdapter
+        return SQLiteAdapter(config)
+    else:
         raise ValueError(
             f"Unknown database type: {db_type}. "
-            f"Supported: {', '.join(adapters.keys())}"
+            f"Supported: snowflake, bigquery, sqlite"
         )
-
-    return adapter_class(config)
 
 
 __all__ = ["get_adapter", "DatabaseAdapter"]

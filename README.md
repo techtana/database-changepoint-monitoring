@@ -1,218 +1,431 @@
-# Snowflake Configuration Change Monitor
+# Database Changepoint Monitoring
 
-A lightweight Python tool that takes a daily snapshot of Snowflake configuration tables and records exactly what changed — new rows, deleted rows, and updated values — into a queryable change-log table.
+A lightweight Python tool that takes daily snapshots of database configuration tables and records exactly what changed — new rows, deleted rows, and updated values — into a queryable change-log table.
 
----
-
-## Background
-
-Several software systems read their runtime configuration from Snowflake tables. These configs are edited manually by humans and changes can be hard to trace after the fact. The monitor provides a historical audit trail: given any date, you can query which config rows were added, removed, or had specific values changed.
-
-A key characteristic of the config tables is that primary key values are not always standard identifiers. Some rows use regex-pattern PKs (e.g. `regex(abc.*)`) that the consuming software resolves at runtime by matching the pattern against an actual lookup key. The monitor treats all PK values as opaque strings — no regex resolution is performed at monitoring time — which is the correct approach for tracking row identity across snapshots.
+**Supports**: Snowflake, BigQuery, SQLite, and extensible for other databases.
 
 ---
 
-## Design
+## Quick Start
 
-### Approach: daily snapshot diff
+### 1. Install Dependencies
 
-Rather than using database triggers or CDC (Change Data Capture), the tool takes a full snapshot of each monitored table once per day and compares it against the previous day's snapshot. This approach was chosen because:
+```bash
+# Minimal (SQLite only)
+pip install PyYAML python-dotenv
 
-- It works without schema changes or trigger permissions on the source tables.
-- It is resilient to tables that have no `updated_at` timestamp.
-- The full snapshot is stored, making it easy to reconstruct the complete config state for any past date.
+# With Snowflake
+pip install -r requirements.txt
 
-### Data flow
-
-```
-Source config tables
-        │
-        ▼
-  take_snapshot()          SELECT pk_cols + value_cols
-        │
-        ▼
-  write_snapshot()         Persist to DAILY_SNAPSHOTS (Snowflake VARIANT columns)
-        │
-        ▼
-  compare_snapshots()      Pure set-arithmetic diff — no DB I/O
-        │
-        ▼
-  write_changes()          Bulk-insert into CHANGE_LOG
+# With BigQuery
+pip install PyYAML python-dotenv google-cloud-bigquery>=3.11.0
 ```
 
-### Snowflake support tables
+### 2. Configure
 
-**`DAILY_SNAPSHOTS`** — one row per source-table row per day. PK and value columns are serialised as JSON `VARIANT`, making the schema agnostic to the structure of any individual config table.
-
-| Column | Type | Notes |
-|---|---|---|
-| `snapshot_date` | DATE | The day of the snapshot |
-| `table_name` | VARCHAR | Fully-qualified source table name |
-| `pk_json` | VARIANT | JSON object of PK column → value |
-| `values_json` | VARIANT | JSON object of monitored value column → value |
-
-**`CHANGE_LOG`** — one row per changed field per day.
-
-| Column | Type | Notes |
-|---|---|---|
-| `change_date` | DATE | Day the change was detected |
-| `table_name` | VARCHAR | Source table |
-| `pk_json` | VARIANT | Row identity |
-| `change_type` | VARCHAR | `INSERT`, `DELETE`, or `UPDATE` |
-| `column_name` | VARCHAR | NULL for INSERT/DELETE; column name for UPDATE |
-| `old_value` | VARCHAR | Previous value (NULL for INSERT) |
-| `new_value` | VARCHAR | New value (NULL for DELETE) |
-
-For `INSERT` and `DELETE` events, `old_value` / `new_value` holds the full JSON-serialised values dict so no information is lost.
-
-### Module structure
-
-| File | Role |
-|---|---|
-| `db.py` | Snowflake connection, query helpers, DDL bootstrap |
-| `snapshot.py` | Read/write snapshots; idempotency check |
-| `comparator.py` | Pure diff function — no DB I/O, fully unit-testable |
-| `changelog.py` | Bulk-insert change rows |
-| `monitor.py` | Orchestrator entry point |
-| `config.yaml` | Table definitions (edit this for your environment) |
-| `run_monitor.bat` | Windows Task Scheduler launcher (self-locating, no hardcoded paths) |
-| `run_monitor.sh` | Unix/macOS cron launcher |
-| `.env.example` | Template for Snowflake credentials — copy to `.env` |
-| `.gitignore` | Excludes `.env` and `logs/` from version control |
-
----
-
-## Key Decisions
-
-**1. Schema-agnostic snapshot storage via JSON**
-Different config tables have different column sets (some wide, some long, varying PK arities). Storing `pk_json` and `values_json` as Snowflake `VARIANT` means a single pair of support tables serves all monitored tables without per-table schema changes.
-
-**2. PK values treated as opaque strings**
-Regex-pattern PKs like `regex(abc.*)` are stored and compared as literal strings. Row identity across two snapshots is determined by exact string equality of the serialised PK JSON. This is correct: if a human changes a PK from `regex(abc.*)` to `regex(abc_\d+.*)`, that is a genuine row replacement (DELETE + INSERT), not an update to a value column.
-
-**3. Sorted JSON keys for stable identity**
-All `pk_json` values are produced with `json.dumps(..., sort_keys=True)`. This ensures that a row with `{pk1: "A", pk2: "B"}` always hashes to the same string regardless of the order columns were returned by Snowflake.
-
-**4. All values cast to `str` before comparison**
-Snowflake may return numeric, boolean, or NULL values. Casting everything to `str` at snapshot time avoids type-change false-positives (e.g. integer `1` vs string `"1"` being flagged as an update when the column type is altered). The cast policy is applied consistently at both write time and compare time.
-
-**5. Idempotent daily runs**
-Before taking a snapshot, the script checks whether one already exists for today. If the script is re-run (e.g. after a failure mid-way), it skips already-completed tables rather than creating duplicate snapshot or change-log rows.
-
-**6. First-run / gap handling**
-If no snapshot exists for "yesterday" (first ever run, or a day was skipped), all current rows are recorded as `INSERT` events in the change log. This seeds the audit trail without producing false DELETE events for rows that were simply never captured before.
-
----
-
-## Configuration
-
-Edit `config.yaml` to point at your real Snowflake tables:
+Edit `config.yaml` to select your database:
 
 ```yaml
+database:
+  type: "snowflake"  # or "bigquery", "sqlite"
+  snowflake:
+    account:   "${SNOWFLAKE_ACCOUNT}"
+    user:      "${SNOWFLAKE_USER}"
+    password:  "${SNOWFLAKE_PASSWORD}"
+    warehouse: "${SNOWFLAKE_WAREHOUSE}"
+    database:  "${SNOWFLAKE_DATABASE}"
+    role:      "${SNOWFLAKE_ROLE}"
+
 monitoring:
   snapshot_table: "MYDB.MONITORING.DAILY_SNAPSHOTS"
   changelog_table: "MYDB.MONITORING.CHANGE_LOG"
 
 tables:
   - name: "MYDB.CONFIG.TABLE_A"
-    pk_columns:    [pk1, pk2, pk3]
-    value_columns: [val1, val2, val3]
+    pk_columns: [pk1, pk2]
+    value_columns: [val1, val2]
 ```
 
-- `pk_columns` — columns that uniquely identify a row. Values may be literal strings or regex patterns; both work without any special treatment.
-- `value_columns` — the only columns whose values are compared for change detection. Group/metadata columns not listed here are ignored.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for full configuration options and database-specific setup.
 
----
+### 3. Set Credentials
 
-## Setup
-
-**1. Clone / copy the project to any directory on your machine.**
-No paths are hardcoded anywhere in the project; launchers resolve their own location at runtime.
-
-**2. Install dependencies**
 ```bash
-pip install -r requirements.txt
+# Copy the template
+cp .env.example .env
+
+# Fill in your credentials
+SNOWFLAKE_ACCOUNT=...
+SNOWFLAKE_USER=...
+SNOWFLAKE_PASSWORD=...
+# etc.
 ```
 
-**3. Configure credentials**
+### 4. Run
 
-Copy `.env.example` to `.env` and fill in your values:
-```bash
-cp .env.example .env   # Unix/macOS
-copy .env.example .env  # Windows
-```
-
-`.env` is loaded automatically by `monitor.py` via `python-dotenv` and is excluded from version control by `.gitignore`. Alternatively, set the same keys as system or shell environment variables (required for Task Scheduler / cron running under a service account).
-
-**4. Configure tables**
-
-Edit `config.yaml` — replace the `MYDB.*` placeholders with your real Snowflake fully-qualified table names, and set the correct `pk_columns` and `value_columns` for each table.
-
-**5. Run manually the first time**
 ```bash
 python monitor.py
 ```
-This creates the support tables if they do not exist, takes the first snapshot, and populates the change log with INSERT baseline rows.
 
-**6. Schedule**
-
-_Windows — Task Scheduler:_
-- Create a Daily task pointing at `run_monitor.bat`.
-- Set "Start in" to the project directory (or leave blank — the script self-locates via `%~dp0`).
-- Enable "Run whether user is logged on or not" and "Run with highest privileges".
-- Set `SNOWFLAKE_*` vars as System environment variables so the service account can read them.
-- Output is appended to `logs\monitor.log`.
-
-_Unix / macOS — cron:_
+Or with a custom config:
 ```bash
-chmod +x run_monitor.sh
-crontab -e
-# Add: run daily at 06:00
-0 6 * * * /path/to/database_changepoint_monitoring/run_monitor.sh
+python monitor.py config.test.yaml
 ```
-Output is appended to `logs/monitor.log`.
 
 ---
 
-## Querying the Change Log
+## Key Features
 
-**All changes on a given day:**
+- **Multi-database support**: Works with Snowflake, BigQuery, SQLite, and more
+- **Daily snapshot diff**: Compares snapshots to detect INSERTs, DELETEs, and column UPDATEs
+- **Queryable audit trail**: Full history stored in support tables
+- **Opaque PK handling**: Treats all PK values as strings (works with regex patterns)
+- **Idempotent**: Re-run without creating duplicates
+- **Database-agnostic core**: Change detection logic works identically across all databases
+
+---
+
+## Architecture
+
+The codebase uses an **adapter pattern** to abstract database differences:
+
+```
+Monitor Orchestrator
+    ↓
+Core Logic (database-agnostic)
+    ├── snapshot.py       (read/write snapshots)
+    ├── changelog.py      (write changes)
+    └── comparator.py     (pure diff algorithm)
+    ↓
+Database Adapter (type-specific)
+    ├── SnowflakeAdapter  (snowflake.py)
+    ├── BigQueryAdapter   (bigquery.py)
+    ├── SQLiteAdapter     (sqlite.py)
+    └── Custom adapters   (extensible)
+```
+
+For detailed architecture, implementation patterns, and how to add new databases, see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
+---
+
+## Data Model
+
+### Snapshot Table (`DAILY_SNAPSHOTS`)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `snapshot_date` | DATE | The day of the snapshot |
+| `table_name` | VARCHAR | Fully-qualified source table name |
+| `pk_json` | JSON | Serialized primary key columns |
+| `values_json` | JSON | Serialized value columns |
+
+**Example**:
+```
+snapshot_date | table_name      | pk_json             | values_json
+2026-05-02    | MYDB.CONFIG.TBL | {"pk1":"a","pk2":"b"} | {"val1":"x","val2":"y"}
+```
+
+### Changelog Table (`CHANGE_LOG`)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `change_date` | DATE | Day the change was detected |
+| `table_name` | VARCHAR | Source table |
+| `pk_json` | JSON | Row identity |
+| `change_type` | VARCHAR | `INSERT`, `DELETE`, or `UPDATE` |
+| `column_name` | VARCHAR | NULL for INSERT/DELETE; column name for UPDATE |
+| `old_value` | VARCHAR | Previous value (NULL for INSERT) |
+| `new_value` | VARCHAR | New value (NULL for DELETE) |
+
+---
+
+## Query Examples
+
+### All changes on a specific day
+
 ```sql
+-- Snowflake
 SELECT * FROM MYDB.MONITORING.CHANGE_LOG
+WHERE change_date = '2026-05-02'
+ORDER BY table_name, pk_json, column_name;
+
+-- BigQuery
+SELECT * FROM my_project.monitoring.CHANGE_LOG
+WHERE change_date = '2026-05-02'
+ORDER BY table_name, pk_json, column_name;
+
+-- SQLite
+SELECT * FROM CHANGE_LOG
 WHERE change_date = '2026-05-02'
 ORDER BY table_name, pk_json, column_name;
 ```
 
-**History of a specific config row:**
+### History of a specific config row
+
 ```sql
+-- Snowflake
 SELECT * FROM MYDB.MONITORING.CHANGE_LOG
 WHERE table_name = 'MYDB.CONFIG.TABLE_A'
-  AND pk_json:pk1::STRING = 'regex(abc.*)'
+  AND JSON_EXTRACT_PATH_TEXT(pk_json, 'pk1') = 'my_value'
+ORDER BY change_date;
+
+-- BigQuery
+SELECT * FROM my_project.monitoring.CHANGE_LOG
+WHERE table_name = 'MYDB.CONFIG.TABLE_A'
+  AND JSON_EXTRACT_SCALAR(pk_json, '$.pk1') = 'my_value'
+ORDER BY change_date;
+
+-- SQLite
+SELECT * FROM CHANGE_LOG
+WHERE table_name = 'CONFIG_TABLE_A'
+  AND json_extract(pk_json, '$.pk1') = 'my_value'
 ORDER BY change_date;
 ```
 
-**What the config looked like on a specific date:**
-```sql
-SELECT TO_JSON(pk_json), TO_JSON(values_json)
-FROM MYDB.MONITORING.DAILY_SNAPSHOTS
-WHERE table_name    = 'MYDB.CONFIG.TABLE_A'
-  AND snapshot_date = '2026-05-01';
+---
+
+## Testing
+
+Run the included test suite (uses in-memory SQLite, no setup required):
+
+```bash
+python test_refactoring.py
 ```
+
+Expected output:
+```
+======================================================================
+Testing SQLite Adapter
+======================================================================
+1. Creating support tables...
+   [OK] Tables created successfully
+2. Creating test data table...
+   [OK] Test table created
+...
+[SUCCESS] All tests passed!
+```
+
+---
+
+## Scheduling
+
+### Windows (Task Scheduler)
+
+Use `run_monitor.bat` — it self-locates and handles all paths:
+```batch
+run_monitor.bat
+```
+
+In Task Scheduler, set it to run daily, and make sure `SNOWFLAKE_*` (or `GCP_*` / SQLite path) environment variables are set system-wide.
+
+### Unix/macOS (cron)
+
+```bash
+chmod +x run_monitor.sh
+crontab -e
+# Add:
+0 6 * * * /path/to/database_changepoint_monitoring/run_monitor.sh
+```
+
+---
+
+## Design Decisions
+
+1. **Daily snapshots over CDC**: No schema changes, no trigger permissions, works with any table structure
+2. **Opaque PK strings**: All PK values (including regex patterns) are compared as literal strings — correct for auditing identity changes
+3. **JSON storage**: Adapts to any table schema without requiring per-table DDL changes
+4. **Type coercion**: All values cast to strings at snapshot time, preventing false change detection from type conversions
+5. **Adapter pattern**: Easy to add new database types; core logic is database-agnostic
 
 ---
 
 ## Limitations
 
-- **Daily granularity only.** Multiple changes to the same row within a single day are not captured; only the state at snapshot time is recorded. If a value is changed and then reverted within the same day, no change will be detected.
+- **Daily granularity only** — changes within a single day are not captured
+- **Snapshot storage grows linearly** — consider purging old snapshots periodically
+- **Schema changes break snapshots** — update `config.yaml` when source table columns change
+- **No intra-day alerting** — designed for end-of-day auditing, not real-time monitoring
 
-- **No intra-day alerting.** The tool is designed for end-of-day auditing, not real-time monitoring. For immediate alerts on config changes, database triggers or Snowflake Dynamic Tables would be more appropriate.
+---
 
-- **Snapshot storage grows linearly.** `DAILY_SNAPSHOTS` accumulates one row per source row per day indefinitely. For large config tables or long retention periods, a periodic purge policy should be added (e.g. `DELETE FROM ... WHERE snapshot_date < DATEADD(day, -90, CURRENT_DATE)`).
+## When to Use This Tool vs Alternatives
 
-- **Regex PKs are not resolved.** The monitor does not interpret `regex(abc.*)` patterns or determine which actual runtime lookup keys they match. It only tracks whether the pattern string itself changed. If the consuming software's regex matching logic is what you want to audit, that is out of scope.
+### ✅ Use This Tool When
 
-- **Schema changes break snapshots.** If a `pk_column` or `value_column` listed in `config.yaml` is renamed or dropped in the source table, the `take_snapshot` SELECT will fail. The config must be updated in sync with any source schema changes.
+| Scenario | Why It Works Well |
+|----------|-------------------|
+| **Manual config edits** | Humans edit tables directly; need to audit "who changed what and when" |
+| **No CDC permissions** | Can't enable Snowflake Streams, BigQuery Data Transfer, or database triggers |
+| **Multi-vendor environment** | Same auditing for Snowflake, BigQuery, SQLite, PostgreSQL with single tool |
+| **End-of-day reports** | Business logic runs nightly; daily snapshots suffice |
+| **Small-to-medium tables** | < 10M rows; snapshot storage cost is acceptable |
+| **Configuration as data** | Tables hold runtime config, feature flags, rules; changes are infrequent |
+| **Simple compliance needs** | Regulatory requirement: "show what changed on 2026-05-02" |
+| **No infrastructure overhead** | Just Python + cron/Task Scheduler; no external services |
+| **Offline-first workflow** | Works without real-time infrastructure; resilient to network issues |
 
-- **No multi-day gap recovery.** If the scheduler is offline for several days, only the most recent missed day is effectively captured on the next run (today vs yesterday). Rows that changed and reverted during the gap will not appear in the log.
+**Example use cases**:
+- Audit trail for permission tables (`users`, `roles`, `permissions`)
+- Track configuration changes in operational tables
+- History of feature flags or business rules
+- Compliance requirements for configuration tables
+- Change tracking for systems that read from database tables
 
-- **Credentials are plain-text environment variables.** For production use, consider replacing `SNOWFLAKE_PASSWORD` with key-pair authentication or a secrets manager integration.
+---
+
+### ❌ Better Alternatives When
+
+| Scenario | Better Tool | Why |
+|----------|------------|-----|
+| **Real-time alerting needed** | Database Triggers / Webhooks | Immediate notification on change; not waiting for daily run |
+| **Sub-second accuracy required** | Change Data Capture (CDC) | Snowflake Streams, MySQL Binlog, PostgreSQL WAL; captures every transaction |
+| **High-volume OLTP tables** | Event sourcing / CQRS | Millions of writes/sec; snapshots not feasible |
+| **Complex transformations** | dbt / Airflow | Codified transformations; data warehouse; multi-stage pipelines |
+| **Large fact tables** | Data warehouse incremental loads | Designed for TB-scale; snapshot diff not efficient |
+| **Streaming requirements** | Apache Kafka / Pulsar | Real-time event stream; downstream consumption |
+| **Unstructured data** | Data lake with object versioning | S3 versioning, DLT, etc. for blobs / archives |
+| **Ad-hoc analysis** | Query logs, Git blame analogy | For code/SQL changes; use VCS history instead |
+| **Multi-table transactions** | Transaction log auditing | For transactional consistency; need ACID guarantees |
+
+---
+
+### Performance Comparison
+
+| Aspect | This Tool | CDC | Triggers | dbt |
+|--------|-----------|-----|----------|-----|
+| **Latency** | Daily (batch) | Seconds | Milliseconds | Hourly/daily |
+| **Accuracy** | Daily snapshot | 100% (every tx) | 100% (every tx) | Deterministic |
+| **Storage growth** | Linear (1 snapshot/day) | Exponential (all events) | Depends | Manageable |
+| **Setup complexity** | Low (Python + cron) | Medium (schema/streams) | High (triggers) | High (dbt project) |
+| **Cost (small table)** | ~$1-5/month | $100+/month | Included | ~$50+/month |
+| **Cost (large table)** | ~$50-200/month | $1000+/month | Included | $200+/month |
+| **Intra-day changes** | ❌ Lost | ✅ Captured | ✅ Captured | ❌ Lost |
+| **Real-time alerts** | ❌ No | ✅ Yes | ✅ Yes | ❌ No |
+
+---
+
+### Decision Matrix
+
+```
+Do you need real-time alerting?
+├─ YES → Use triggers, CDC, or Kafka
+└─ NO → Continue...
+
+Do you need sub-second accuracy?
+├─ YES → Use CDC or event streaming
+└─ NO → Continue...
+
+Is the table < 10M rows?
+├─ YES → Continue...
+└─ NO → Consider data warehouse tools (dbt, Airflow)
+
+Do you have CDC/trigger permissions?
+├─ YES → Consider CDC for compliance; use this tool for simplicity
+└─ NO → Continue...
+
+Do you need daily audit trail?
+├─ YES → ✅ Use this tool
+└─ NO → Reconsider requirements
+```
+
+---
+
+### Specific Recommendations
+
+#### Scenario 1: "We need to audit permission table changes"
+- **Permission table**: rows = 100K, changes/day = 5-10
+- **This tool**: Perfect fit ✅
+- **Why**: Low change volume, daily auditing sufficient, simple compliance story
+- **Alternative**: CDC (overkill), triggers (adds write latency)
+
+#### Scenario 2: "We track user activity with millions of events/day"
+- **Event table**: rows = 100M+, writes/sec = 1000+
+- **This tool**: Poor fit ❌
+- **Why**: Storage explosion (10GB+ daily snapshots), slow comparisons
+- **Alternative**: Kafka → data warehouse (dbt/Snowflake) → BI tool
+- **Cost**: $200-500/mo vs. $50/mo (but get real-time analytics)
+
+#### Scenario 3: "We changed a config value and need to know when/what"
+- **Config table**: rows = 50, changes/week = 2-3
+- **This tool**: Excellent ✅
+- **Why**: Lightweight, maintains full history, queryable, no infrastructure
+- **Alternative**: Git (if version-controlled), database audit logs (if available)
+- **Overhead**: 5 minutes to set up vs. 2+ hours for CDC/triggers
+
+#### Scenario 4: "We need real-time alerts when someone modifies the admins table"
+- **Admin table**: rows = 100, changes/day = 1-2, needs **immediate** alert
+- **This tool**: Not suitable ❌ (daily only)
+- **Why**: Alert delayed until next day
+- **Alternative**: Trigger → webhook/Slack, or CDC → alert pipeline
+- **Cost/complexity**: Medium; immediate visibility worth the investment
+
+---
+
+### Hybrid Approach
+
+Many orgs use **multiple tools**:
+
+```
+Configuration tables
+├─ This tool (daily audit trail) ← Compliance, history
+├─ Triggers → Slack (real-time alerts) ← Ops visibility
+└─ dbt (nightly load to warehouse) ← Analytics
+
+Event/activity tables
+├─ Kafka stream ← Real-time consumption
+├─ Data warehouse aggregation ← Analytics
+└─ Event sourcing ← Audit trail
+```
+
+---
+
+### Cost-Benefit Summary
+
+#### This Tool is Worth It If
+- Table size: < 50M rows
+- Change frequency: < 1000/day
+- Latency tolerance: > 1 day
+- Budget: < $100/month
+- Setup time: 30 minutes to 2 hours
+- Compliance requirement: "Prove what changed when"
+
+#### Switch to Alternatives If
+- Real-time alerts required
+- Sub-hourly accuracy needed
+- Table grows > 1B rows
+- Change volume > 10K/day
+- You already have data warehouse (dbt, Airflow)
+- Team already maintains CDC infrastructure
+
+---
+
+
+
+1. Create a new adapter file (`databases/new_db.py`)
+2. Implement the `DatabaseAdapter` interface
+3. Update the factory (`databases/__init__.py`)
+4. Update `config.yaml` with database-specific params
+5. Add dependencies to `requirements.txt`
+
+See [ARCHITECTURE.md](ARCHITECTURE.md#adding-a-new-database-type) for detailed example.
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `monitor.py` | Main entry point; orchestrates snapshots and diffs |
+| `config.yaml` | Table definitions and database configuration |
+| `databases/` | Database adapter implementations (extensible) |
+| `core/` | Database-agnostic changepoint logic |
+| `comparator.py` | Pure change-detection algorithm |
+| `ARCHITECTURE.md` | Detailed design and implementation guide |
+| `.env.example` | Template for credentials (copy to `.env`) |
+| `.gitignore` | Excludes `.env` and `logs/` |
+
+---
+
+## Support & Contributing
+
+For issues or new database adapters, consult [ARCHITECTURE.md](ARCHITECTURE.md) for implementation patterns and testing guidance.

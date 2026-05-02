@@ -1,0 +1,17 @@
+# Test configuration for SQLite database
+# Use this to test the refactored code locally without external dependencies
+
+database:
+  type: "sqlite"
+
+  sqlite:
+    path: "./test_changepoint.db"
+
+monitoring:
+  snapshot_table: "DAILY_SNAPSHOTS"
+  changelog_table: "CHANGE_LOG"
+
+tables:
+  - name: "CONFIG_TABLE_A"
+    pk_columns:    [id]
+    value_columns: [config_value, enabled]

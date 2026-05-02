@@ -1,15 +1,39 @@
 # -----------------------------------------------------------------------
-# Snowflake Change Monitor — configuration
+# Change Monitor — configuration for multiple database types
+#
+# database.type           : "snowflake", "bigquery", or "sqlite"
+# database.<type>         : type-specific configuration
 #
 # monitoring.snapshot_table   : fully-qualified name of the snapshot table
 # monitoring.changelog_table  : fully-qualified name of the change-log table
 #
 # tables[].name               : fully-qualified source table to monitor
 # tables[].pk_columns         : columns that uniquely identify a row
-#                               (values may be literal strings OR regex patterns
-#                               like "regex(abc.*)" — treated as opaque strings)
 # tables[].value_columns      : columns whose changes you want to track
 # -----------------------------------------------------------------------
+
+# Choose database type and configure connection
+database:
+  type: "snowflake"  # Options: "snowflake", "bigquery", "sqlite"
+
+  # Snowflake configuration
+  snowflake:
+    account:   "${SNOWFLAKE_ACCOUNT}"
+    user:      "${SNOWFLAKE_USER}"
+    password:  "${SNOWFLAKE_PASSWORD}"
+    warehouse: "${SNOWFLAKE_WAREHOUSE}"
+    database:  "${SNOWFLAKE_DATABASE}"
+    role:      "${SNOWFLAKE_ROLE}"
+
+  # BigQuery configuration (uncomment to use)
+  # bigquery:
+  #   project: "${GCP_PROJECT}"
+  #   dataset: "${GCP_DATASET}"
+  #   credentials_path: "/path/to/service-account.json"  # optional
+
+  # SQLite configuration (uncomment to use)
+  # sqlite:
+  #   path: "./changepoint.db"  # or ":memory:" for in-memory DB
 
 monitoring:
   snapshot_table: "MYDB.MONITORING.DAILY_SNAPSHOTS"

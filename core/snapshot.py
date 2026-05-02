@@ -14,18 +14,25 @@ def take_snapshot(adapter: DatabaseAdapter, table_cfg: dict, snapshot_date: date
     return adapter.execute_query(sql)
 
 
+def _normalize_row_keys(row: dict) -> dict:
+    """Normalize row keys to uppercase for consistent access."""
+    return {k.upper(): v for k, v in row.items()}
+
+
 def _pk_json(row: dict, pk_columns: list[str]) -> str:
     """Serialize PK columns to sorted JSON."""
+    normalized = _normalize_row_keys(row)
     return json.dumps(
-        {k: str(row[k.upper()]) for k in pk_columns},
+        {k: str(normalized[k.upper()]) for k in pk_columns},
         sort_keys=True,
     )
 
 
 def _values_json(row: dict, value_columns: list[str]) -> str:
     """Serialize value columns to sorted JSON."""
+    normalized = _normalize_row_keys(row)
     return json.dumps(
-        {k: str(row[k.upper()]) for k in value_columns},
+        {k: str(normalized[k.upper()]) for k in value_columns},
         sort_keys=True,
     )
 
@@ -82,8 +89,9 @@ def read_snapshot(
     rows = adapter.execute_query(sql, (snapshot_date.isoformat(), table_name))
     result = {}
     for row in rows:
-        pk_str = row["pk_json"]
-        values = json.loads(row["values_json"])
+        normalized = _normalize_row_keys(row)
+        pk_str = normalized["PK_JSON"]
+        values = json.loads(normalized["VALUES_JSON"])
         result[pk_str] = values
     return result
 
@@ -103,4 +111,5 @@ def snapshot_exists(
           AND table_name    = ?
     """
     rows = adapter.execute_query(sql, (snapshot_date.isoformat(), table_name))
-    return rows[0]["cnt"] > 0
+    normalized = _normalize_row_keys(rows[0])
+    return normalized["CNT"] > 0

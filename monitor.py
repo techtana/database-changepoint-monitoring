@@ -11,10 +11,10 @@ try:
 except ImportError:
     pass
 
-from changelog import write_changes
+from databases import get_adapter
+from core.changelog import write_changes
+from core.snapshot import read_snapshot, snapshot_exists, take_snapshot, write_snapshot
 from comparator import compare_snapshots
-from db import ensure_support_tables, get_connection
-from snapshot import read_snapshot, snapshot_exists, take_snapshot, write_snapshot
 
 
 def _setup_logging() -> None:
@@ -33,16 +33,47 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def _substitute_env_vars(obj):
+    """Recursively substitute ${VAR_NAME} with environment variables."""
+    if isinstance(obj, dict):
+        return {k: _substitute_env_vars(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_substitute_env_vars(item) for item in obj]
+    elif isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
+        var_name = obj[2:-1]
+        value = os.environ.get(var_name)
+        if value is None:
+            raise EnvironmentError(f"Environment variable not set: {var_name}")
+        return value
+    return obj
+
+
 def run(config_path: str = "config.yaml") -> None:
     _setup_logging()
     log = logging.getLogger(__name__)
 
     cfg = load_config(config_path)
+    cfg = _substitute_env_vars(cfg)
+
+    database_cfg = cfg.get("database", {})
+    db_type = database_cfg.get("type", "snowflake")
+    db_config = database_cfg.get(db_type, {})
+
     monitoring_cfg = cfg["monitoring"]
 
-    conn = get_connection()
+    # Get adapter and establish connection
+    adapter = get_adapter(db_type, db_config)
+    adapter.connect()
+
     try:
-        ensure_support_tables(conn, cfg)
+        # Create support tables if needed
+        snapshot_table = monitoring_cfg["snapshot_table"]
+        changelog_table = monitoring_cfg["changelog_table"]
+        snapshot_ddl, changelog_ddl = adapter.get_support_tables_ddl(
+            snapshot_table, changelog_table
+        )
+        adapter.execute_query(snapshot_ddl)
+        adapter.execute_query(changelog_ddl)
 
         today = date.today()
         yesterday = today - timedelta(days=1)
@@ -52,16 +83,18 @@ def run(config_path: str = "config.yaml") -> None:
             pk_columns = table_cfg["pk_columns"]
             value_columns = table_cfg["value_columns"]
 
-            if snapshot_exists(conn, monitoring_cfg, table_name, today):
+            if snapshot_exists(adapter, monitoring_cfg, table_name, today):
                 log.info("[%s] Snapshot already exists for today — skipping.", table_name)
                 continue
 
             log.info("[%s] Taking snapshot for %s …", table_name, today)
-            today_rows = take_snapshot(conn, table_cfg, today)
-            write_snapshot(conn, monitoring_cfg, table_name, today, today_rows, pk_columns, value_columns)
+            today_rows = take_snapshot(adapter, table_cfg, today)
+            write_snapshot(
+                adapter, monitoring_cfg, table_name, today, today_rows, pk_columns, value_columns
+            )
             log.info("[%s] Wrote %d rows to snapshot.", table_name, len(today_rows))
 
-            yesterday_snap = read_snapshot(conn, monitoring_cfg, table_name, yesterday)
+            yesterday_snap = read_snapshot(adapter, monitoring_cfg, table_name, yesterday)
             if not yesterday_snap:
                 log.warning(
                     "[%s] No snapshot found for %s (first run or gap). "
@@ -69,7 +102,7 @@ def run(config_path: str = "config.yaml") -> None:
                     table_name, yesterday,
                 )
 
-            today_snap = read_snapshot(conn, monitoring_cfg, table_name, today)
+            today_snap = read_snapshot(adapter, monitoring_cfg, table_name, today)
 
             changes = compare_snapshots(
                 table_name=table_name,
@@ -79,7 +112,7 @@ def run(config_path: str = "config.yaml") -> None:
                 change_date=today,
             )
 
-            n = write_changes(conn, monitoring_cfg, changes)
+            n = write_changes(adapter, monitoring_cfg, changes)
 
             inserts  = sum(1 for c in changes if c["change_type"] == "INSERT")
             deletes  = sum(1 for c in changes if c["change_type"] == "DELETE")
@@ -89,7 +122,7 @@ def run(config_path: str = "config.yaml") -> None:
                 table_name, inserts, deletes, updates, n,
             )
     finally:
-        conn.close()
+        adapter.close()
 
 
 if __name__ == "__main__":
